@@ -171,7 +171,28 @@ impl Painter {
                 size
             }
         };
-        let prompt_selector = select_prompt_row(suspended_state, cursor::position()?);
+        // pleme-io fork: a cursor-position (CPR / `ESC[6n`) read failure must
+        // never abort the line editor. Terminals answer late, lose the answer
+        // in event races, or never answer at all (frost incident 2026-06-10:
+        // a lost CPR answer fatally killed the shell; an unanswering terminal
+        // froze it — the error from `cursor::position()?` here propagated out
+        // of `read_line` and the host treated it as fatal). CPR is an
+        // OPTIMIZATION for prompt placement, not a liveness dependency:
+        //  - suspended painter: reuse the previous prompt start row;
+        //  - fresh prompt: claim "column 1, bottom row", which routes through
+        //    the make-room branch below (one CRLF) so existing output is
+        //    never overwritten — worst case is one blank line.
+        let position = match cursor::position() {
+            Ok(position) => position,
+            Err(_) => {
+                if let Some(painter_state) = suspended_state {
+                    self.prompt_start_row = *painter_state.previous_prompt_rows_range.start();
+                    return Ok(());
+                }
+                (1, self.terminal_size.1.saturating_sub(1))
+            }
+        };
+        let prompt_selector = select_prompt_row(suspended_state, position);
         self.prompt_start_row = match prompt_selector {
             PromptRowSelector::UseExistingPrompt { start_row } => start_row,
             PromptRowSelector::MakeNewPrompt { new_row } => {
