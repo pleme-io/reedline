@@ -21,7 +21,14 @@ chrono = { version = "0.4.19", default-features = false, features = [
     "serde",
 ] }
 crossbeam = { version = "0.8.2", optional = true }
-crossterm = { version = "0.28.1", features = ["serde"] }
+# pleme-io fork: `use-dev-tty` switches crossterm's unix event source from
+# mio/kqueue (persistent per-fd-instance registration — DELETED by the kernel
+# when fd 0 is momentarily closed, e.g. a shell's dup2-restore of an fd0
+# redirect, leaving the editor input-deaf forever) to the poll(2) source,
+# which rebuilds its pollfd set on every read: no registration, nothing to
+# lose when an fd instance cycles. Closes the 2026-06-10 fd0 input-liveness
+# residual (frost persona row builtin_stdin_redirect_must_not_wedge_next_prompt).
+crossterm = { version = "0.28.1", features = ["serde", "use-dev-tty", "events"] }
 fd-lock = "4.0.2"
 itertools = "0.13.0"
 nu-ansi-term = "0.50.0"
