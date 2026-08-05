@@ -1,0 +1,11 @@
+vendored upstream fork — this repo mirrors a third-party project and carries
+its ORIGINAL CI. Restandardizing someone else's workflows onto pleme-io
+reusables is not ours to do: it would diverge us from upstream in the files
+most likely to conflict on every merge, for no benefit we actually collect.
+
+Reviewed 2026-08-04 as part of the fleet-wide GHA workflow review. This is a
+permanent, deliberate exemption — not a backlog item.
+
+Scope note: it waives the SHIM requirement only. Everything else that applies
+to a vendored repo (secret hygiene, the NO-SHELL rule for code we author here,
+supply-chain pins in anything we add) still applies.
