@@ -1,9 +1,24 @@
+# ── Auto-trigger disabled by pleme-io, 2026-08-08 ───────────────────────────
+# UPSTREAM's own CI, vendored in with the crate, firing on every push to this
+# PRIVATE fork and billing the org's Actions minutes to test a dependency we
+# consume as a nix-built caixa and do not develop here.
+#
+# This file escaped the first sweep because its runner comes from a MATRIX
+# (`runs-on: ${{ matrix.<var> }}`) rather than a literal, so a scan for bare
+# `runs-on: ubuntu-*` did not see it. The billing is identical either way.
+#
+# The file is KEPT and stays runnable on demand (MODULARIZE, DON'T DELETE).
+# The original trigger is preserved verbatim below.
+#
+# ORIGINAL TRIGGER:
+# on:
+#   pull_request:
+#   push: # Run CI on the main branch after every merge. This is important to fill the GitHub Actions cache in a way that pull requests can see it
+#     branches:
+#       - main
+#
 on:
-  pull_request:
-  push: # Run CI on the main branch after every merge. This is important to fill the GitHub Actions cache in a way that pull requests can see it
-    branches:
-      - main
-
+  workflow_dispatch:
 name: continuous-integration
 
 jobs:
