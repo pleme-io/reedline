@@ -63,15 +63,14 @@ jobs:
         run: cargo nextest run --all ${{ matrix.flags }}
 
       - name: Check for clean repo
-        shell: bash
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "there are changes";
-            git status --porcelain
-            exit 1
-          else
-            echo "no changes in working directory";
-          fi
+        uses: pleme-io/actions/paths-dirty@main
+        with:
+          expect: clean
+          reason: |
+            The build left the working tree dirty. Something in the steps above
+            writes into the repo — a generated file, a lockfile update, a cache
+            artifact — and whatever it is belongs either in the commit or in
+            .gitignore, not discovered on the next run.
 
       - name: Check lockfile
         run: cargo check --locked ${{ matrix.flags }} --all-targets --all
