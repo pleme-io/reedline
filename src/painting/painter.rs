@@ -91,6 +91,11 @@ pub struct Painter {
     // Stdout
     stdout: W,
     prompt_start_row: u16,
+    /// Did the PREVIOUS paint also see the cursor above the prompt?
+    ///
+    /// The reset that follows sets `prompt_start_row = 0` and clears the screen
+    /// from there, so it must not fire on a single answer. See `is_reset`.
+    reset_seen_last_paint: bool,
     // The number of lines that the prompt takes up
     prompt_height: u16,
     terminal_size: (u16, u16),
@@ -105,6 +110,7 @@ impl Painter {
         Painter {
             stdout,
             prompt_start_row: 0,
+            reset_seen_last_paint: false,
             prompt_height: 0,
             terminal_size: (0, 0),
             last_required_lines: 0,
@@ -285,21 +291,33 @@ impl Painter {
         // ★ It fails SAFE. Disagreement means "do not reset", which leaves the
         // prompt where it is. The worst case is a missed reset — cosmetic — and
         // never a wipe. Tier: only-mitigated; the seal is correlation.
-        let is_reset = || {
-            let Ok(first) = cursor::position() else {
-                return false;
-            };
-            if first.1 + 1 >= self.prompt_start_row {
-                return false;
-            }
-            match cursor::position() {
-                Ok(second) => second == first,
-                Err(_) => false,
-            }
+        // ★ ONE QUERY, CORROBORATED ACROSS PAINTS — NOT TWO IN ONE PAINT.
+        //
+        // The first version of this guard read `cursor::position()` twice and
+        // required agreement. That DOUBLED the DSR traffic, and on a terminal
+        // whose answers can reach the shell as input it doubled the visible
+        // damage: the operator went from one `^[[31;24R` to two side by side.
+        // A guard that makes the symptom worse is not a guard.
+        //
+        // So the corroboration is over TIME instead: one read per paint, as
+        // before, and the reset only fires when two CONSECUTIVE paints both
+        // report it. A single stale answer — the one-behind desync — cannot
+        // survive that, because the next paint's answer is a different stale
+        // value. A genuinely reset terminal reports it every paint.
+        //
+        // Same guarantee, zero added queries.
+        let observed_reset = match cursor::position() {
+            // when output something without newline, the cursor position is at
+            // current line, but the prompt_start_row is next line. `add 1`
+            // handles that case.
+            Ok(position) => position.1 + 1 < self.prompt_start_row,
+            Err(_) => false,
         };
+        let is_reset = observed_reset && self.reset_seen_last_paint;
+        self.reset_seen_last_paint = observed_reset;
 
         // Moving the start position of the cursor based on the size of the required lines
-        if self.large_buffer || is_reset() {
+        if self.large_buffer || is_reset {
             for _ in 0..screen_height.saturating_sub(lines_before_cursor) {
                 self.stdout.queue(Print(&coerce_crlf("\n")))?;
             }
