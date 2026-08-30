@@ -1,3 +1,4 @@
+pub mod dsr;
 mod painter;
 mod prompt_lines;
 mod styled_text;
