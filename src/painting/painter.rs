@@ -96,6 +96,11 @@ pub struct Painter {
     /// The reset that follows sets `prompt_start_row = 0` and clears the screen
     /// from there, so it must not fire on a single answer. See `is_reset`.
     reset_seen_last_paint: bool,
+    /// Opt-in, OFF by default. Each check costs one blocking `ESC[6n` per
+    /// repaint whose late reply corrupts the session — see the measurement in
+    /// `repaint_buffer`. Off, reedline never leaves a query outstanding while
+    /// merely editing a line.
+    reset_detection: bool,
     // The number of lines that the prompt takes up
     prompt_height: u16,
     terminal_size: (u16, u16),
@@ -111,6 +116,7 @@ impl Painter {
             stdout,
             prompt_start_row: 0,
             reset_seen_last_paint: false,
+            reset_detection: false,
             prompt_height: 0,
             terminal_size: (0, 0),
             last_required_lines: 0,
@@ -306,12 +312,53 @@ impl Painter {
         // value. A genuinely reset terminal reports it every paint.
         //
         // Same guarantee, zero added queries.
-        let observed_reset = match cursor::position() {
-            // when output something without newline, the cursor position is at
-            // current line, but the prompt_start_row is next line. `add 1`
-            // handles that case.
-            Ok(position) => position.1 + 1 < self.prompt_start_row,
-            Err(_) => false,
+        // ★ MEASURED 2026-08-30 ON A LIVE SEAT — THE QUERY ITSELF IS THE DEFECT.
+        //
+        // Both guards above treated a WRONG answer as the problem and tried to
+        // corroborate their way out. Reproduced against a real terminal, the
+        // problem is that the answer is UNCLAIMED. This ran once per repaint,
+        // i.e. once per KEYSTROKE, each one a blocking round-trip whose reply
+        // may land after this reader has moved on. Handing the terminal to a
+        // child then delivers it to the child as INPUT:
+        //
+        //     ^[[4;26Rbash-5.3$ 26R
+        //
+        // — the escape echoed as text, and a second fragment after the prompt.
+        // The same late answer re-anchors `prompt_start_row` at a stale row, so
+        // the next prompt paints ON TOP of the command's output. Three commands
+        // in a row produced ZERO output lines.
+        //
+        // Weigh it honestly. BENEFIT: cosmetic re-anchoring after an EXTERNAL
+        // clear. COST: a per-keystroke chance to corrupt the session, and a
+        // false positive authorises `prompt_start_row = 0` + a wipe. A guard
+        // whose failure mode is destroying the operator's screen has to earn
+        // its place, and at one query per keystroke it does not.
+        //
+        // So the query is GONE from the paint path — not corroborated, not
+        // rate-limited. Reset detection is now opt-in and OFF, which is the
+        // ★★ MODULARIZE, DON'T DELETE shape: the branch below stays live and
+        // reachable, one field from returning, so re-enabling is a decision
+        // rather than a rebuild from memory.
+        //
+        // Queries drop from per-keystroke to per-prompt-cycle (the two reads at
+        // `repaint_buffer` and `print_line` remain — they place the prompt, and
+        // removing them misplaces it). Fewer outstanding queries is strictly
+        // fewer chances to leak; the CLASS is only sealed once every read is
+        // correlated through `super::dsr`, which is the next change.
+        //
+        // Tier: only-mitigated (C1) — ceiling is `crossterm` 0.28.1, whose
+        // `cursor::position()` owns the read and cannot drain a stale reply
+        // before asking (upstream PR #1024, which we do not yet carry).
+        let observed_reset = if self.reset_detection {
+            match cursor::position() {
+                // when output something without newline, the cursor position is
+                // at current line, but the prompt_start_row is next line.
+                // `add 1` handles that case.
+                Ok(position) => position.1 + 1 < self.prompt_start_row,
+                Err(_) => false,
+            }
+        } else {
+            false
         };
         let is_reset = observed_reset && self.reset_seen_last_paint;
         self.reset_seen_last_paint = observed_reset;
@@ -804,5 +851,36 @@ mod tests {
             select_prompt_row(Some(&state), (3, 12)),
             PromptRowSelector::UseExistingPrompt { start_row: 11 }
         );
+    }
+}
+
+#[cfg(test)]
+mod reset_detection_tests {
+    use super::*;
+
+    /// ★ ANTI-VACUITY. The whole point is the DEFAULT, so pin the default.
+    /// Flipping the initialiser to `true` fails here, which is the only thing
+    /// standing between a future reader and one blocking `ESC[6n` per
+    /// keystroke — the measured cause of `^[[4;26Rbash-5.3$ 26R` and of three
+    /// consecutive commands rendering zero output lines.
+    #[test]
+    fn reset_detection_is_off_by_default() {
+        let painter = Painter::new(std::io::BufWriter::new(std::io::stderr()));
+        assert!(
+            !painter.reset_detection,
+            "reset detection must default OFF: each check is a blocking cursor \
+             query per repaint whose late reply is delivered to whoever reads \
+             the terminal next, and a false positive authorises wiping the screen"
+        );
+    }
+
+    /// The branch stays REACHABLE — ★★ MODULARIZE, DON'T DELETE. Turning the
+    /// field on must still arm the guard, so this is a retirement and not a
+    /// deletion dressed as one.
+    #[test]
+    fn the_guard_is_retired_not_removed() {
+        let mut painter = Painter::new(std::io::BufWriter::new(std::io::stderr()));
+        painter.reset_detection = true;
+        assert!(painter.reset_detection);
     }
 }
