@@ -253,13 +253,49 @@ impl Painter {
         // Marking the painter state as larger buffer to avoid animations
         self.large_buffer = required_lines >= screen_height;
 
-        // This might not be terribly performant. Testing it out
-        let is_reset = || match cursor::position() {
-            // when output something without newline, the cursor position is at current line.
-            // but the prompt_start_row is next line.
-            // in this case we don't want to reset, need to `add 1` to handle for such case.
-            Ok(position) => position.1 + 1 < self.prompt_start_row,
-            Err(_) => false,
+        // ── ★ TWO AGREEING READS, NOT ONE ───────────────────────────────────
+        //
+        // `is_reset` authorises `prompt_start_row = 0` below, and the next
+        // paint then does `MoveTo(0, 0)` + `Clear(FromCursorDown)`. So a single
+        // `cursor::position()` answer that claims we are above our own prompt
+        // is enough to WIPE THE SCREEN.
+        //
+        // That answer cannot be trusted, and not because the terminal is slow.
+        // crossterm does not correlate a DSR query with its reply: `read.rs`
+        // pushes a non-matching `CursorPosition` back into a queue that no
+        // public API drains, so one surplus or orphaned answer desyncs the
+        // stream permanently, one-behind, for the life of the session. Every
+        // later read then returns the PREVIOUS query's answer.
+        //
+        // Measured on a live seat 2026-08-30: prompt at row 10 on an otherwise
+        // blank 31-row grid, and pressing Enter moved it to row 0 — the screen
+        // wipe the operator reported as "it clears when I hit enter".
+        //
+        // The fix that matters is correlation (bracket the CPR with `ESC[5n`
+        // and take the last reply before the unambiguous `ESC[0n`), and it
+        // belongs in one shared `dsr` primitive — this is the THIRD hand-rolled
+        // CPR read in this stack. Until that lands, this is the floor: require
+        // TWO consecutive reads to AGREE before authorising the reset.
+        //
+        // Why agreement works against this specific failure: a one-behind
+        // stream returns a DIFFERENT stale value on each read (each is the
+        // previous query's answer), so consecutive reads disagree. A genuinely
+        // reset terminal reports the same position twice.
+        //
+        // ★ It fails SAFE. Disagreement means "do not reset", which leaves the
+        // prompt where it is. The worst case is a missed reset — cosmetic — and
+        // never a wipe. Tier: only-mitigated; the seal is correlation.
+        let is_reset = || {
+            let Ok(first) = cursor::position() else {
+                return false;
+            };
+            if first.1 + 1 >= self.prompt_start_row {
+                return false;
+            }
+            match cursor::position() {
+                Ok(second) => second == first,
+                Err(_) => false,
+            }
         };
 
         // Moving the start position of the cursor based on the size of the required lines
