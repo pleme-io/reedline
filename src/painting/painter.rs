@@ -110,6 +110,24 @@ pub struct Painter {
     after_cursor_lines: Option<String>,
 }
 
+/// The drain, as a pure function over a reader so it is provable without a
+/// terminal. See `Painter::drained_cursor_position` for the measurement that
+/// motivates it.
+fn drain_until_stable<F>(mut read: F) -> Result<(u16, u16)>
+where
+    F: FnMut() -> Result<(u16, u16)>,
+{
+    let mut last = read()?;
+    for _ in 0..3 {
+        let next = read()?;
+        if next == last {
+            return Ok(next);
+        }
+        last = next;
+    }
+    Ok(last)
+}
+
 impl Painter {
     pub(crate) fn new(stdout: W) -> Self {
         Painter {
@@ -194,7 +212,7 @@ impl Painter {
         //  - fresh prompt: claim "column 1, bottom row", which routes through
         //    the make-room branch below (one CRLF) so existing output is
         //    never overwritten — worst case is one blank line.
-        let position = match cursor::position() {
+        let position = match Self::drained_cursor_position() {
             Ok(position) => position,
             Err(_) => {
                 if let Some(painter_state) = suspended_state {
@@ -624,6 +642,55 @@ impl Painter {
         Ok(())
     }
 
+    /// Read the cursor position, draining any BACKLOGGED answer first.
+    ///
+    /// ★ MEASURED BY SYSCALL TRACE ON A LIVE SEAT, 2026-08-31. Not reasoned.
+    ///
+    /// `strace` on the running shell, one command per cycle:
+    ///
+    /// ```text
+    /// cycle 1   paint ESC[26;1H ESC[J      answer read: ESC[1;1R    (row 1)
+    /// cycle 2   paint ESC[1;1H  ESC[J      answer read: ESC[31;1R   (row 31)
+    /// ```
+    ///
+    /// Every query has exactly one answer with a correct value, which is why
+    /// this reads as healthy and why three previous fixes missed it. The defect
+    /// is the OFFSET: paint N uses answer N-1. Cycle 2 moves to row 1 and
+    /// issues `ESC[J` while the cursor is really at row 31, so clear-to-end
+    /// erases the command's entire output. That is the missing output.
+    ///
+    /// The cause is a one-deep backlog inside crossterm's internal event
+    /// queue. `cursor::position()` writes `ESC[6n` and then returns the OLDEST
+    /// buffered answer — so it hands back the previous query's reply while this
+    /// query's reply is buffered for next time. The offset never heals: once
+    /// one extra answer is buffered it is inherited forever. Upstream fixes
+    /// this by draining before asking (crossterm PR #1024); we are pinned to
+    /// 0.28.1 and cannot patch its private queue from here.
+    ///
+    /// ★ WHY REPEATING THE QUERY TERMINATES, rather than being a second guess.
+    /// Nothing moves the cursor between two back-to-back reads, so a drained
+    /// queue returns the SAME pair twice. Backlog of N yields
+    /// `old₁ … old_N, fresh, fresh, …` and the first repeat is the drained
+    /// value. Agreement is therefore a real fixpoint, not a coincidence to
+    /// hope for — and if two stale answers happen to agree, they agree on a
+    /// position that is still correct for a cursor that has not moved.
+    ///
+    /// Bounded at four reads so a terminal that answers differently every time
+    /// degrades to "use the last one" instead of looping forever — the
+    /// reconciler-liveness rule that a loop must be bounded, applied to a
+    /// terminal round-trip.
+    ///
+    /// This is cheap where the earlier per-paint guard was not: this runs once
+    /// per PROMPT (`initialize_prompt_position` is called once per
+    /// `read_line`), not once per keystroke.
+    ///
+    /// ★ TIER: only-mitigated (C1). Ceiling is crossterm 0.28.1 owning the
+    /// read. Bumping past PR #1024 replaces this with a real drain; correlating
+    /// the answer to its query (`super::dsr`) is the seal.
+    fn drained_cursor_position() -> Result<(u16, u16)> {
+        drain_until_stable(cursor::position)
+    }
+
     /// Updates prompt origin and offset to handle a screen resize event
     pub(crate) fn handle_resize(&mut self, width: u16, height: u16) {
         self.terminal_size = (width, height);
@@ -882,5 +949,56 @@ mod reset_detection_tests {
         let mut painter = Painter::new(std::io::BufWriter::new(std::io::stderr()));
         painter.reset_detection = true;
         assert!(painter.reset_detection);
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn reader(seq: Vec<(u16, u16)>) -> impl FnMut() -> Result<(u16, u16)> {
+        let cell = RefCell::new(seq.into_iter());
+        move || Ok(cell.borrow_mut().next().expect("reader exhausted"))
+    }
+
+    /// ★ THE MEASURED CASE. A one-deep backlog hands back the PREVIOUS query's
+    /// answer; the fresh one is buffered behind it. On the live seat this made
+    /// the painter move to row 1 and clear-to-end while the cursor was at row
+    /// 31, erasing the command's output. The drain must return 30, not 0.
+    #[test]
+    fn a_one_deep_backlog_is_drained() {
+        let got = drain_until_stable(reader(vec![(1, 0), (1, 30), (1, 30)])).unwrap();
+        assert_eq!(
+            got,
+            (1, 30),
+            "with one stale answer buffered, the FIRST read is the previous \
+             query's reply — taking it is what painted over the output"
+        );
+    }
+
+    /// Anti-vacuity: with nothing buffered the very first repeat agrees, so the
+    /// drain costs exactly two reads and changes no behaviour. If this ever
+    /// needed more, the drain would be adding round-trips on the happy path.
+    #[test]
+    fn an_empty_backlog_settles_on_the_second_read() {
+        let got = drain_until_stable(reader(vec![(4, 7), (4, 7)])).unwrap();
+        assert_eq!(got, (4, 7));
+    }
+
+    /// A deeper backlog still converges rather than returning a middle value.
+    #[test]
+    fn a_two_deep_backlog_is_drained() {
+        let got = drain_until_stable(reader(vec![(1, 0), (1, 9), (1, 22), (1, 22)])).unwrap();
+        assert_eq!(got, (1, 22));
+    }
+
+    /// ★ BOUNDED. A terminal answering differently every time must not spin —
+    /// the reconciler-liveness rule that every loop is bounded, applied to a
+    /// terminal round-trip. Four reads, then take the last and move on.
+    #[test]
+    fn a_terminal_that_never_agrees_terminates() {
+        let got = drain_until_stable(reader(vec![(1, 1), (1, 2), (1, 3), (1, 4)])).unwrap();
+        assert_eq!(got, (1, 4), "must stop at the bound, not loop forever");
     }
 }
